@@ -10,6 +10,7 @@ import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
+import { Workspace } from "@/control-plane/workspace"
 import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -88,6 +89,7 @@ export const TaskTool = Tool.define(
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const workspaces = yield* Workspace.Service
 
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
@@ -136,6 +138,24 @@ export const TaskTool = Tool.define(
       const session = params.task_id
         ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
         : undefined
+      let workspaceID = session?.workspaceID
+      if (!session && flags.experimentalWorkspaces) {
+        const configured = flags.subagentWorkspace.trim()
+        const type =
+          configured ||
+          (process.env.SANDBOXD_ADDR ? "sandboxd" : "worktree")
+        if (type !== "none") {
+          const space = yield* workspaces.create({
+            type,
+            projectID: parent.projectID,
+            extra: {
+              parent_session_id: ctx.sessionID,
+              subagent: next.name,
+            },
+          })
+          workspaceID = space.id
+        }
+      }
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
         subagent: next,
@@ -159,6 +179,7 @@ export const TaskTool = Tool.define(
           parentID: ctx.sessionID,
           title: params.description + ` (@${next.name} subagent)`,
           agent: next.name,
+          workspaceID,
           permission: [
             ...childPermission,
             ...childToolDenies.filter(

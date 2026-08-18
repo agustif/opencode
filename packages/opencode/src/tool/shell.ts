@@ -17,6 +17,8 @@ import { ShellID } from "./shell/id"
 
 import * as Truncate from "./truncate"
 import { Plugin } from "@/plugin"
+import { Workspace } from "@/control-plane/workspace"
+import { sandboxdExec, type SandboxdExtra } from "@/control-plane/adapters/sandboxd"
 import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
@@ -616,6 +618,34 @@ export const ShellTool = Tool.define(
                 throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
               }
               const timeout = params.timeout ?? defaultTimeoutMs
+              const workspaceID = yield* InstanceState.workspaceID
+              if (workspaceID) {
+                const workspaces = yield* Workspace.Service
+                const space = yield* workspaces.get(workspaceID)
+                const extra = (space?.extra ?? undefined) as SandboxdExtra | undefined
+                if (extra?.sandbox_id) {
+                  const result = yield* Effect.tryPromise({
+                    try: () =>
+                      sandboxdExec({
+                        addr: extra.addr,
+                        sandboxId: extra.sandbox_id!,
+                        command: params.command,
+                        timeoutMs: timeout,
+                      }),
+                    catch: (error) => new Error(String(error)),
+                  })
+                  const output = [result.stdout, result.stderr].filter(Boolean).join("\n")
+                  return {
+                    title: params.command,
+                    metadata: {
+                      output,
+                      exit: result.exit,
+                      sandbox_id: extra.sandbox_id,
+                    },
+                    output,
+                  }
+                }
+              }
               const ps = Shell.ps(shell)
               yield* Effect.scoped(
                 Effect.gen(function* () {
