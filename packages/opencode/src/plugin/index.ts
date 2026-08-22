@@ -84,6 +84,13 @@ export namespace Plugin {
       for (const [_name, fn] of Object.entries<PluginInstance>(mod)) {
         if (seen.has(fn)) continue
         seen.add(fn)
+        // Some plugins export auxiliary non-hook objects alongside the hook
+        // (e.g. goal-plugin's `default: { id, server }` metadata). Skip
+        // anything that isn't an init function instead of crashing startup.
+        if (typeof fn !== "function") {
+          log.warn("skipping non-function plugin export", { plugin, export: _name })
+          continue
+        }
         const init = await fn(input)
         hooks.push(init)
       }
