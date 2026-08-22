@@ -18,12 +18,14 @@ import { ProviderTransform } from "@/provider/transform"
 import { Config } from "@/config/config"
 import { Instance } from "@/project/instance"
 import type { Agent } from "@/agent/agent"
-import type { MessageV2 } from "./message-v2"
+import { MessageV2 } from "./message-v2"
 import { Plugin } from "@/plugin"
 import { SystemPrompt } from "./system"
 import { Flag } from "@/flag/flag"
 import { PermissionNext } from "@/permission/next"
 import { Auth } from "@/auth"
+import { ModelFailover } from "./failover"
+import { SessionRetry } from "./retry"
 
 export namespace LLM {
   const log = Log.create({ service: "llm" })
@@ -41,9 +43,73 @@ export namespace LLM {
     small?: boolean
     tools: Record<string, Tool>
     retries?: number
+    /**
+     * When false (default), the caller consumes the returned result directly
+     * and failover is the CALLER's job (the session processor swaps
+     * streamInput.model between attempts). When true, this wrapper handles
+     * failover internally for one-shot calls (title generation, summarize):
+     * a retryable error on the default model hops to the next pool entry.
+     */
+    failover?: boolean
   }
 
   export type StreamOutput = StreamTextResult<ToolSet, unknown>
+
+  /**
+   * Failover-aware stream. Applies to ANY call — main loop, subagent
+   * sessions (they re-enter prompt()), title generation, summarize — when
+   * [model_failover] is enabled AND the requested model is the fanout
+   * default. The FIRST request always goes to the configured provider so
+   * prompts cache normally; only after N consecutive transitive failures
+   * (rate limit / 5xx / transport) does the request hop to the next pool
+   * entry, keeping cache-breaking switches rare and deliberate.
+   *
+   * `threshold` consecutive failures trigger the hop (default 2): a single
+   * blip retries in-place (cheap, cache-warm), a second one means the
+   * endpoint is actually degraded.
+   */
+  const FAILOVER_THRESHOLD = 2
+
+  export async function streamWithFailover(input: StreamInput): Promise<StreamOutput> {
+    if (!input.failover) return stream(input)
+    const pool = await ModelFailover.applies(input.model)
+    if (!pool) return stream(input)
+
+    let current = input.model
+    for (let attempt = 0; ; attempt++) {
+      // Only start failing over AFTER threshold consecutive failures have
+      // been recorded against the active endpoint — earlier failures came
+      // from other callers/turns and are counted by those calls.
+      const failures = ModelFailover.failures({ providerID: current.providerID, modelID: current.id })
+      try {
+        const result = await stream({ ...input, model: current })
+        ModelFailover.markHealthy({ providerID: current.providerID, modelID: current.id })
+        return result
+      } catch (e) {
+        const error = MessageV2.fromError(e, { providerID: current.providerID })
+        if (!MessageV2.APIError.isInstance(error) || !error.data.isRetryable || attempt < FAILOVER_THRESHOLD - 1) {
+          throw e
+        }
+        ModelFailover.markFailed(pool, { providerID: current.providerID, modelID: current.id })
+        const next = ModelFailover.nextHealthy(pool, { providerID: current.providerID, modelID: current.id })
+        if (!next) {
+          log.warn("failover pool exhausted", { reason: error.data.message })
+          throw e
+        }
+        log.info("failing over", {
+          from: `${current.providerID}/${current.id}`,
+          to: `${next.providerID}/${next.modelID}`,
+          reason: error.data.message,
+          attempt,
+        })
+        current = await Provider.getModel(next.providerID, next.modelID)
+        input.abort.addEventListener("abort", () => {}, { once: true })
+        await SessionRetry.sleep(150, input.abort).catch(() => {
+          throw new DOMException("Aborted", "AbortError")
+        })
+      }
+    }
+  }
 
   export async function stream(input: StreamInput) {
     const l = log

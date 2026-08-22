@@ -78,10 +78,11 @@ export namespace SessionSummary {
     if (textPart && !userMsg.summary?.title) {
       const agent = await Agent.get("title")
       if (!agent) return
-      const stream = await LLM.stream({
+      const stream = await LLM.streamWithFailover({
         agent,
         user: userMsg,
         tools: {},
+        failover: true,
         model: agent.model
           ? await Provider.getModel(agent.model.providerID, agent.model.modelID)
           : ((await Provider.getSmallModel(userMsg.model.providerID)) ??

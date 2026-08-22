@@ -7,9 +7,10 @@ import { Snapshot } from "@/snapshot"
 import { SessionSummary } from "./summary"
 import { Bus } from "@/bus"
 import { SessionRetry } from "./retry"
+import { ModelFailover } from "./failover"
 import { SessionStatus } from "./status"
 import { Plugin } from "@/plugin"
-import type { Provider } from "@/provider/provider"
+import { Provider } from "@/provider/provider"
 import { LLM } from "./llm"
 import { Config } from "@/config/config"
 import { SessionCompaction } from "./compaction"
@@ -46,10 +47,17 @@ export namespace SessionProcessor {
         log.info("process")
         needsCompaction = false
         const shouldBreak = (await Config.get()).experimental?.continue_loop_on_deny !== true
+        // Active model for THIS attempt: starts as the requested model and is
+        // swapped to the next failover endpoint when a retryable error hits
+        // (see catch below). Everything per-attempt — LLM.stream, usage cost,
+        // compaction check — reads this, so accounting follows the provider
+        // that actually served the request.
+        let activeModel = streamInput.model
         while (true) {
           try {
             let currentText: MessageV2.TextPart | undefined
             let reasoningMap: Record<string, MessageV2.ReasoningPart> = {}
+            streamInput.model = activeModel
             const stream = await LLM.stream(streamInput)
 
             for await (const value of stream.fullStream) {
@@ -235,10 +243,11 @@ export namespace SessionProcessor {
 
                 case "finish-step":
                   const usage = Session.getUsage({
-                    model: input.model,
+                    model: activeModel,
                     usage: value.usage,
                     metadata: value.providerMetadata,
                   })
+                  ModelFailover.markHealthy(ModelFailover.asEndpoint(activeModel))
                   input.assistantMessage.finish = value.finishReason
                   input.assistantMessage.cost += usage.cost
                   input.assistantMessage.tokens = usage.tokens
@@ -271,7 +280,7 @@ export namespace SessionProcessor {
                     sessionID: input.sessionID,
                     messageID: input.assistantMessage.parentID,
                   })
-                  if (await SessionCompaction.isOverflow({ tokens: usage.tokens, model: input.model })) {
+                  if (await SessionCompaction.isOverflow({ tokens: usage.tokens, model: activeModel })) {
                     needsCompaction = true
                   }
                   break
@@ -341,9 +350,47 @@ export namespace SessionProcessor {
               error: e,
               stack: JSON.stringify(e.stack),
             })
-            const error = MessageV2.fromError(e, { providerID: input.model.providerID })
+            const error = MessageV2.fromError(e, { providerID: activeModel.providerID })
             const retry = SessionRetry.retryable(error)
             if (retry !== undefined) {
+              // Failover hijack: when a pool applies to the requested model,
+              // hop to the next healthy provider instead of backing off
+              // forever on the same (likely rate-limited) endpoint. To avoid
+              // breaking prompt cache on TRANSIENT blips, the first failure
+              // retries in-place on the same provider; only after
+              // FAILOVER_THRESHOLD consecutive failures does the swap happen.
+              // Pool exhaustion falls through to the legacy path.
+              const pool = await ModelFailover.applies(streamInput.model)
+              if (pool) {
+                ModelFailover.markFailed(pool, ModelFailover.asEndpoint(activeModel))
+                const failures = ModelFailover.failures(ModelFailover.asEndpoint(activeModel))
+                const next =
+                  failures >= ModelFailover.FAILOVER_THRESHOLD
+                    ? ModelFailover.nextHealthy(pool, ModelFailover.asEndpoint(activeModel))
+                    : undefined
+                if (next) {
+                  const swapped = await Provider.getModel(next.providerID, next.modelID).catch(() => undefined)
+                  if (swapped) {
+                    attempt++
+                    activeModel = swapped as Provider.Model
+                    log.info("failover", {
+                      from: `${activeModel.providerID}/${activeModel.id}`,
+                      to: `${next.providerID}/${next.modelID}`,
+                      reason: retry,
+                    })
+                    SessionStatus.set(input.sessionID, {
+                      type: "retry",
+                      attempt,
+                      message: `Failing over to ${next.providerID}/${next.modelID}`,
+                      next: Date.now() + 150,
+                    })
+                    await SessionRetry.sleep(150, input.abort).catch(() => {})
+                    continue
+                  }
+                } else {
+                  log.warn("failover pool exhausted; falling back to retry", { reason: retry })
+                }
+              }
               attempt++
               const delay = SessionRetry.delay(attempt, error.name === "APIError" ? error : undefined)
               SessionStatus.set(input.sessionID, {

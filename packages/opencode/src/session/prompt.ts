@@ -1763,11 +1763,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
     const agent = await Agent.get("title")
     if (!agent) return
-    const result = await LLM.stream({
+    const result = await LLM.streamWithFailover({
       agent,
       user: firstRealUser.info as MessageV2.User,
       system: [],
       small: true,
+      failover: true,
       tools: {},
       model: await iife(async () => {
         if (agent.model) return await Provider.getModel(agent.model.providerID, agent.model.modelID)

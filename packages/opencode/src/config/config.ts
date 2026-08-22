@@ -913,6 +913,31 @@ export namespace Config {
         .string()
         .describe("Small model to use for tasks like title generation in the format of provider/model")
         .optional(),
+      model_failover: z
+        .object({
+          enabled: z.boolean().optional().describe("Enable provider failover for the default model family"),
+          default_model: z
+            .string()
+            .describe(
+              "Model (provider/model format) that failover applies to. Retries only swap providers when the active model matches this.",
+            ),
+          pool: z
+            .array(z.string())
+            .optional()
+            .describe(
+              "Ordered failover pool in provider/model format. First healthy entry serves; on retryable errors the request hops to the next entry instead of sleeping out backoff.",
+            ),
+          cooldown_ms: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("Base cooldown after a provider fails (default 60000ms, doubled per consecutive failure, max 10min)"),
+        })
+        .optional()
+        .describe(
+          "Provider failover pool: when a retryable error (rate limit, 5xx, transport) hits the default model, retry immediately on the next pool entry instead of backing off on the same provider.",
+        ),
       default_agent: z
         .string()
         .optional()
